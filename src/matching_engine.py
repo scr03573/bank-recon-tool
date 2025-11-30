@@ -1,5 +1,5 @@
 """
-Intelligent transaction matching engine with fuzzy logic.
+Intelligent transaction matching engine with fuzzy logic and economic validation.
 
 Matches bank transactions to AP records using multiple strategies:
 1. Exact match (check number, amount, date)
@@ -7,21 +7,31 @@ Matches bank transactions to AP records using multiple strategies:
 3. Amount tolerance matching
 4. Reference/ACH code matching
 5. Batch payment detection
+6. Economic data validation (FRED + yfinance)
 """
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal
-from typing import List, Dict, Tuple, Optional, Set
+from typing import List, Dict, Tuple, Optional, Set, Any
 from collections import defaultdict
+import warnings
 
 from rapidfuzz import fuzz, process
 import jellyfish
+import pandas as pd
 
 from .config import config, MatchingConfig
 from .models import (
     BankTransaction, APTransaction, ReconciliationMatch,
     ReconciliationException, MatchStatus, ExceptionType, TransactionType
 )
+
+# Suppress yfinance warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*yfinance.*")
+
+import logging
+logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
 
 @dataclass
@@ -33,6 +43,440 @@ class MatchCandidate:
     score_breakdown: Dict[str, float] = field(default_factory=dict)
     match_reasons: List[str] = field(default_factory=list)
     is_batch_match: bool = False
+    economic_validation: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class EconomicValidationResult:
+    """Result of economic validation for a transaction."""
+    is_valid: bool = True
+    confidence_adjustment: float = 0.0
+    flags: List[str] = field(default_factory=list)
+    market_data: Dict[str, Any] = field(default_factory=dict)
+    validation_details: Dict[str, Any] = field(default_factory=dict)
+
+
+class EconomicValidator:
+    """
+    Validates transactions using economic data from FRED and yfinance.
+
+    Uses real market data to:
+    1. Validate vendor stock tickers (publicly traded companies)
+    2. Adjust confidence based on market conditions
+    3. Flag anomalies based on economic indicators
+    4. Cross-reference payment patterns with market data
+
+    Performance optimizations:
+    - Caches all stock data after first fetch (session-based)
+    - Pre-fetches economic indicators once per session
+    - Uses batch ticker lookups where possible
+    """
+
+    # Map common vendor names to stock tickers
+    VENDOR_TICKERS = {
+        "AMAZON": "AMZN",
+        "AMAZON WEB SERVICES": "AMZN",
+        "AWS": "AMZN",
+        "MICROSOFT": "MSFT",
+        "GOOGLE": "GOOGL",
+        "APPLE": "AAPL",
+        "ADOBE": "ADBE",
+        "SALESFORCE": "CRM",
+        "ORACLE": "ORCL",
+        "IBM": "IBM",
+        "DELL": "DELL",
+        "HP": "HPQ",
+        "CISCO": "CSCO",
+        "INTEL": "INTC",
+        "AT&T": "T",
+        "ATT": "T",
+        "VERIZON": "VZ",
+        "COMCAST": "CMCSA",
+        "FEDEX": "FDX",
+        "UPS": "UPS",
+        "UNITED AIRLINES": "UAL",
+        "AMERICAN AIRLINES": "AAL",
+        "DELTA": "DAL",
+        "MARRIOTT": "MAR",
+        "HILTON": "HLT",
+        "HOME DEPOT": "HD",
+        "LOWES": "LOW",
+        "STAPLES": "SPLS",
+        "OFFICE DEPOT": "ODP",
+        "GRAINGER": "GWW",
+        "FASTENAL": "FAST",
+        "SYSCO": "SYY",
+        "BANK OF AMERICA": "BAC",
+        "WELLS FARGO": "WFC",
+        "CHASE": "JPM",
+        "JPMORGAN": "JPM",
+        "CAPITAL ONE": "COF",
+        "AMERICAN EXPRESS": "AXP",
+        "VISA": "V",
+        "MASTERCARD": "MA",
+        "BLUE CROSS": "ANTM",
+        "AETNA": "CVS",
+        "UNITED HEALTH": "UNH",
+        "STATE FARM": None,  # Private
+        "PROGRESSIVE": "PGR",
+        "ADP": "ADP",
+        "PAYCHEX": "PAYX",
+    }
+
+    def __init__(self, fred_api_key: Optional[str] = None):
+        self.fred_api_key = fred_api_key or config.fred_api_key
+        self._fred = None
+        self._stock_cache: Dict[str, Dict[str, Any]] = {}  # ticker -> price/volume data
+        self._econ_cache: Dict[str, float] = {}
+        self._econ_fetched: bool = False
+        self._stocks_prefetched: bool = False
+
+    def _get_fred(self):
+        """Lazy load FRED client."""
+        if self._fred is None and self.fred_api_key:
+            try:
+                from fredapi import Fred
+                self._fred = Fred(api_key=self.fred_api_key)
+            except Exception:
+                pass
+        return self._fred
+
+    def prefetch_all_stock_data(self):
+        """Pre-fetch all known stock tickers in one batch for performance."""
+        if self._stocks_prefetched:
+            return
+
+        # Get vendor tickers plus market indices
+        tickers_to_fetch = [t for t in set(self.VENDOR_TICKERS.values()) if t is not None]
+        tickers_to_fetch.append('^GSPC')  # S&P 500 for large payment validation
+
+        try:
+            import yfinance as yf
+            # Batch download all tickers at once
+            tickers_str = " ".join(tickers_to_fetch)
+            data = yf.download(tickers_str, period='5d', progress=False, threads=True)
+
+            if data is not None and not data.empty:
+                for ticker in tickers_to_fetch:
+                    try:
+                        # Handle both single and multi-ticker dataframe formats
+                        if isinstance(data.columns, pd.MultiIndex):
+                            # Multi-ticker format: columns are (Price, Ticker)
+                            if ('Close', ticker) in data.columns:
+                                close_prices = data[('Close', ticker)]
+                            elif ticker in data['Close'].columns:
+                                close_prices = data['Close'][ticker]
+                            else:
+                                close_prices = None
+                        else:
+                            # Single ticker format
+                            close_prices = data['Close'] if 'Close' in data.columns else None
+
+                        if close_prices is not None and len(close_prices.dropna()) > 0:
+                            last_price = float(close_prices.dropna().iloc[-1])
+                            self._stock_cache[ticker] = {
+                                'price': round(last_price, 2),
+                                'active': True
+                            }
+                            if len(close_prices.dropna()) >= 2:
+                                first_price = float(close_prices.dropna().iloc[0])
+                                if first_price > 0:
+                                    change = (last_price - first_price) / first_price
+                                    self._stock_cache[ticker]['price_change_5d'] = round(change * 100, 2)
+                        else:
+                            self._stock_cache[ticker] = {'active': False}
+                    except Exception:
+                        self._stock_cache[ticker] = {'active': False}
+        except Exception:
+            pass
+
+        self._stocks_prefetched = True
+
+    def _refresh_economic_data(self):
+        """Refresh economic indicators from FRED (once per session)."""
+        if self._econ_fetched:
+            return
+
+        self._econ_cache = {}
+        fred = self._get_fred()
+        target_date = date.today()
+
+        if fred:
+            try:
+                # Fed Funds Rate
+                ff = fred.get_series('FEDFUNDS', observation_start=target_date - timedelta(days=30))
+                if ff is not None and len(ff) > 0:
+                    self._econ_cache['fed_funds_rate'] = float(ff.iloc[-1])
+
+                # 10Y Treasury
+                t10 = fred.get_series('DGS10', observation_start=target_date - timedelta(days=30))
+                if t10 is not None and len(t10) > 0:
+                    self._econ_cache['treasury_10y'] = float(t10.iloc[-1])
+
+                # 2Y Treasury
+                t2 = fred.get_series('DGS2', observation_start=target_date - timedelta(days=30))
+                if t2 is not None and len(t2) > 0:
+                    self._econ_cache['treasury_2y'] = float(t2.iloc[-1])
+
+            except Exception:
+                pass
+
+        # Get VIX from yfinance (single fetch)
+        try:
+            import yfinance as yf
+            vix = yf.Ticker('^VIX')
+            hist = vix.history(period='5d')
+            if hist is not None and len(hist) > 0:
+                self._econ_cache['vix'] = float(hist['Close'].iloc[-1])
+        except Exception:
+            pass
+
+        self._econ_fetched = True
+
+    def validate_transaction(
+        self,
+        bank_tx: BankTransaction,
+        ap_tx: APTransaction,
+        base_confidence: float
+    ) -> EconomicValidationResult:
+        """
+        Validate a transaction match using economic data.
+
+        Returns confidence adjustment and validation flags.
+        """
+        result = EconomicValidationResult()
+        result.validation_details['base_confidence'] = base_confidence
+
+        # Refresh economic data (cached after first call)
+        self._refresh_economic_data()
+        # Pre-fetch stock data (cached after first call)
+        self.prefetch_all_stock_data()
+        result.market_data = self._econ_cache.copy()
+
+        # 1. Validate vendor via stock ticker (uses cached data)
+        vendor_validation = self._validate_vendor_ticker(ap_tx.vendor_name)
+        if vendor_validation:
+            result.validation_details['vendor_validation'] = vendor_validation
+            if vendor_validation.get('ticker_found'):
+                result.flags.append(f"Vendor verified: {vendor_validation['ticker']} (${vendor_validation.get('price', 'N/A')})")
+                result.confidence_adjustment += 0.02  # Small boost for verified vendor
+            if vendor_validation.get('company_active'):
+                result.flags.append("Company confirmed active in market")
+                result.confidence_adjustment += 0.01
+
+        # 2. Check for economic anomalies
+        anomalies = self._check_economic_anomalies(bank_tx, ap_tx)
+        if anomalies:
+            result.validation_details['anomalies'] = anomalies
+            for anomaly in anomalies:
+                result.flags.append(anomaly['message'])
+                result.confidence_adjustment += anomaly.get('adjustment', 0)
+
+        # 3. Validate payment timing against market conditions
+        timing_validation = self._validate_payment_timing(bank_tx, ap_tx)
+        if timing_validation:
+            result.validation_details['timing'] = timing_validation
+            result.flags.extend(timing_validation.get('flags', []))
+            result.confidence_adjustment += timing_validation.get('adjustment', 0)
+
+        # 4. Large payment validation with market context
+        large_payment_check = self._validate_large_payment(bank_tx, ap_tx)
+        if large_payment_check:
+            result.validation_details['large_payment'] = large_payment_check
+            result.flags.extend(large_payment_check.get('flags', []))
+            result.confidence_adjustment += large_payment_check.get('adjustment', 0)
+
+        # Cap adjustment
+        result.confidence_adjustment = max(-0.10, min(0.10, result.confidence_adjustment))
+        result.is_valid = result.confidence_adjustment >= -0.05
+
+        return result
+
+    def _validate_vendor_ticker(self, vendor_name: str) -> Optional[Dict[str, Any]]:
+        """Validate vendor by checking stock ticker (uses cached data)."""
+        if not vendor_name:
+            return None
+
+        # Normalize and lookup ticker
+        normalized = vendor_name.upper()
+        for suffix in [' INC', ' LLC', ' LTD', ' CORP', ' CORPORATION', ' CO']:
+            normalized = normalized.replace(suffix, '')
+        normalized = normalized.strip()
+
+        ticker_symbol = None
+        for vendor_key, symbol in self.VENDOR_TICKERS.items():
+            if vendor_key in normalized or normalized in vendor_key:
+                ticker_symbol = symbol
+                break
+
+        if not ticker_symbol:
+            return {'ticker_found': False, 'vendor': vendor_name}
+
+        # Get stock data from cache (pre-fetched)
+        result = {
+            'ticker_found': True,
+            'ticker': ticker_symbol,
+            'vendor': vendor_name,
+            'company_active': False
+        }
+
+        # Use cached data instead of making API call
+        if ticker_symbol in self._stock_cache:
+            cached = self._stock_cache[ticker_symbol]
+            result['company_active'] = cached.get('active', False)
+            if 'price' in cached:
+                result['price'] = cached['price']
+            if 'price_change_5d' in cached:
+                result['price_change_5d'] = cached['price_change_5d']
+                if abs(cached['price_change_5d']) > 10:  # >10% move
+                    result['unusual_activity'] = True
+
+        return result
+
+    def _check_economic_anomalies(
+        self,
+        bank_tx: BankTransaction,
+        ap_tx: APTransaction
+    ) -> List[Dict[str, Any]]:
+        """Check for anomalies based on economic conditions."""
+        anomalies = []
+
+        vix = self._econ_cache.get('vix')
+        fed_rate = self._econ_cache.get('fed_funds_rate')
+        t10 = self._econ_cache.get('treasury_10y')
+        t2 = self._econ_cache.get('treasury_2y')
+
+        # High volatility environment
+        if vix and vix > 30:
+            anomalies.append({
+                'type': 'high_volatility',
+                'message': f"High market volatility (VIX: {vix:.1f}) - extra scrutiny recommended",
+                'adjustment': -0.02,
+                'vix': vix
+            })
+        elif vix and vix > 25:
+            anomalies.append({
+                'type': 'elevated_volatility',
+                'message': f"Elevated volatility (VIX: {vix:.1f})",
+                'adjustment': -0.01,
+                'vix': vix
+            })
+
+        # Inverted yield curve (recession indicator)
+        if t10 and t2 and t2 > t10:
+            spread = t10 - t2
+            anomalies.append({
+                'type': 'inverted_yield_curve',
+                'message': f"Yield curve inverted ({spread:.2f}%) - heightened economic risk",
+                'adjustment': -0.01,
+                'spread': spread
+            })
+
+        # High rate environment (large payments more significant)
+        amount = float(abs(bank_tx.amount))
+        if fed_rate and fed_rate > 5.0 and amount > 50000:
+            daily_interest = amount * (fed_rate / 100) / 365
+            anomalies.append({
+                'type': 'high_rate_large_payment',
+                'message': f"Large payment in high-rate environment (daily carry cost: ${daily_interest:.2f})",
+                'adjustment': 0,
+                'daily_interest': daily_interest
+            })
+
+        return anomalies
+
+    def _validate_payment_timing(
+        self,
+        bank_tx: BankTransaction,
+        ap_tx: APTransaction
+    ) -> Optional[Dict[str, Any]]:
+        """Validate payment timing against economic conditions."""
+        result = {'flags': [], 'adjustment': 0}
+
+        if not bank_tx.transaction_date or not ap_tx.payment_date:
+            return None
+
+        days_diff = (bank_tx.transaction_date - ap_tx.payment_date).days
+
+        # Early payment analysis
+        fed_rate = self._econ_cache.get('fed_funds_rate')
+        if fed_rate:
+            # Standard 2/10 net 30 discount = ~36% APR
+            discount_apr = 36.0
+
+            if fed_rate > discount_apr / 4:  # If rate > 9%, holding cash is valuable
+                if days_diff < 0:  # Paid early
+                    result['flags'].append(f"Early payment when rates high ({fed_rate:.2f}%) - verify discount taken")
+
+            result['fed_rate_context'] = fed_rate
+
+        # Weekend/holiday payment check (using market data)
+        if bank_tx.transaction_date.weekday() >= 5:  # Weekend
+            result['flags'].append("Weekend transaction date - verify posting date")
+            result['adjustment'] -= 0.01
+
+        return result if result['flags'] or result['adjustment'] != 0 else None
+
+    def _validate_large_payment(
+        self,
+        bank_tx: BankTransaction,
+        ap_tx: APTransaction
+    ) -> Optional[Dict[str, Any]]:
+        """Extra validation for large payments."""
+        amount = float(abs(bank_tx.amount))
+
+        if amount < 100000:
+            return None
+
+        result = {'flags': [], 'adjustment': 0}
+
+        # Check S&P 500 for market context (use cached data if available)
+        if '^GSPC' in self._stock_cache:
+            cached = self._stock_cache['^GSPC']
+            if 'price_change_5d' in cached:
+                sp_change = cached['price_change_5d'] / 100  # Convert from percentage
+                result['sp500_5d_change'] = cached['price_change_5d']
+                if sp_change < -0.03:  # Market down >3%
+                    result['flags'].append(f"Large payment during market decline (S&P 500: {sp_change*100:.1f}%)")
+                    result['adjustment'] -= 0.01
+
+        # Wire transfer verification
+        if bank_tx.transaction_type == TransactionType.WIRE and amount > 500000:
+            result['flags'].append(f"Large wire transfer (${amount:,.2f}) - verify authorization")
+
+        return result if result['flags'] else None
+
+    def get_market_summary(self) -> Dict[str, Any]:
+        """Get current market summary for reporting."""
+        self._refresh_economic_data()
+
+        summary = {
+            'as_of': date.today().isoformat(),
+            'indicators': {}
+        }
+
+        if 'fed_funds_rate' in self._econ_cache:
+            summary['indicators']['fed_funds_rate'] = f"{self._econ_cache['fed_funds_rate']:.2f}%"
+
+        if 'treasury_10y' in self._econ_cache:
+            summary['indicators']['treasury_10y'] = f"{self._econ_cache['treasury_10y']:.2f}%"
+
+        if 'vix' in self._econ_cache:
+            vix = self._econ_cache['vix']
+            summary['indicators']['vix'] = f"{vix:.1f}"
+            if vix > 30:
+                summary['market_condition'] = 'HIGH_VOLATILITY'
+            elif vix > 20:
+                summary['market_condition'] = 'ELEVATED_VOLATILITY'
+            else:
+                summary['market_condition'] = 'NORMAL'
+
+        if 'treasury_10y' in self._econ_cache and 'treasury_2y' in self._econ_cache:
+            spread = self._econ_cache['treasury_10y'] - self._econ_cache['treasury_2y']
+            summary['indicators']['yield_curve_spread'] = f"{spread:.2f}%"
+            summary['yield_curve_inverted'] = spread < 0
+
+        return summary
 
 
 class MatchingEngine:
@@ -44,11 +488,34 @@ class MatchingEngine:
     2. Strong matches (amount + date + vendor)
     3. Fuzzy matches (similar amounts, dates, vendor names)
     4. Batch detection (one bank tx -> multiple AP txs)
+    5. Economic validation (FRED + yfinance)
     """
 
-    def __init__(self, cfg: Optional[MatchingConfig] = None):
+    def __init__(self, cfg: Optional[MatchingConfig] = None, enable_economic_validation: bool = True):
         self.config = cfg or config.matching
         self._vendor_name_cache: Dict[str, str] = {}
+        self.enable_economic_validation = enable_economic_validation
+        self._economic_validator: Optional[EconomicValidator] = None
+        self._economic_stats: Dict[str, int] = {
+            'vendors_validated': 0,
+            'tickers_found': 0,
+            'anomalies_detected': 0,
+            'confidence_adjustments': 0
+        }
+
+    @property
+    def economic_validator(self) -> EconomicValidator:
+        """Lazy-load economic validator."""
+        if self._economic_validator is None:
+            self._economic_validator = EconomicValidator()
+        return self._economic_validator
+
+    def get_economic_stats(self) -> Dict[str, Any]:
+        """Get statistics from economic validation."""
+        stats = self._economic_stats.copy()
+        if self._economic_validator:
+            stats['market_summary'] = self._economic_validator.get_market_summary()
+        return stats
 
     def match_transactions(
         self,
@@ -516,18 +983,57 @@ class MatchingEngine:
         confidence: float,
         reasons: List[str]
     ) -> ReconciliationMatch:
-        """Create a ReconciliationMatch object."""
+        """Create a ReconciliationMatch object with economic validation."""
+
+        # Apply economic validation if enabled
+        economic_reasons = []
+        adjusted_confidence = confidence
+
+        if self.enable_economic_validation and ap_transactions:
+            try:
+                # Validate against first AP transaction (primary vendor)
+                validation = self.economic_validator.validate_transaction(
+                    bank_tx, ap_transactions[0], confidence
+                )
+
+                # Apply confidence adjustment
+                adjusted_confidence = min(1.0, max(0.0, confidence + validation.confidence_adjustment))
+
+                # Track stats
+                self._economic_stats['vendors_validated'] += 1
+                if validation.confidence_adjustment != 0:
+                    self._economic_stats['confidence_adjustments'] += 1
+
+                # Add economic validation flags to reasons
+                for flag in validation.flags:
+                    if 'verified' in flag.lower() or 'confirmed' in flag.lower():
+                        economic_reasons.append(f"[ECON] {flag}")
+                        if 'ticker' in flag.lower():
+                            self._economic_stats['tickers_found'] += 1
+                    elif 'volatility' in flag.lower() or 'risk' in flag.lower():
+                        economic_reasons.append(f"[ECON WARNING] {flag}")
+                        self._economic_stats['anomalies_detected'] += 1
+                    else:
+                        economic_reasons.append(f"[ECON] {flag}")
+
+            except Exception as e:
+                # Don't fail matching if economic validation fails
+                economic_reasons.append(f"[ECON] Validation skipped: {str(e)[:30]}")
+
+        # Combine reasons
+        all_reasons = reasons + economic_reasons
+
         match = ReconciliationMatch(
             bank_transaction=bank_tx,
             ap_transactions=ap_transactions,
-            confidence_score=confidence,
-            match_reasons=reasons
+            confidence_score=adjusted_confidence,
+            match_reasons=all_reasons
         )
 
-        # Determine status based on confidence
-        if confidence >= 0.95:
+        # Determine status based on adjusted confidence
+        if adjusted_confidence >= 0.95:
             match.match_status = MatchStatus.MATCHED
-        elif confidence >= 0.80:
+        elif adjusted_confidence >= 0.80:
             match.match_status = MatchStatus.PARTIAL_MATCH
         else:
             match.match_status = MatchStatus.MANUAL_REVIEW

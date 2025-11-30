@@ -367,6 +367,50 @@ def run_stress_test(scale: str = "medium"):
         file_size = Path(path).stat().st_size / 1024
         console.print(f"  [cyan]{fmt.upper()}:[/cyan] {path} ({file_size:.1f} KB)")
 
+    # Show economic validation stats from matches
+    econ_validated = 0
+    tickers_found = 0
+    econ_warnings = 0
+
+    for match in result.matches:
+        for reason in match.match_reasons:
+            if '[ECON]' in reason:
+                econ_validated += 1
+                if 'verified' in reason.lower():
+                    tickers_found += 1
+            if '[ECON WARNING]' in reason:
+                econ_warnings += 1
+
+    if econ_validated > 0:
+        econ_table = Table(title="Economic Validation Integration", box=box.ROUNDED)
+        econ_table.add_column("Metric", style="cyan")
+        econ_table.add_column("Value", justify="right")
+
+        econ_table.add_row("Matches w/ Economic Data", f"{econ_validated:,}")
+        econ_table.add_row("Vendors Verified (Tickers)", f"{tickers_found:,}")
+        econ_table.add_row("Economic Warnings", f"[yellow]{econ_warnings:,}[/yellow]")
+
+        # Sample economic reasons from matches
+        sample_reasons = []
+        for match in result.matches[:50]:
+            for reason in match.match_reasons:
+                if '[ECON]' in reason and reason not in sample_reasons:
+                    sample_reasons.append(reason)
+                    if len(sample_reasons) >= 5:
+                        break
+            if len(sample_reasons) >= 5:
+                break
+
+        if sample_reasons:
+            econ_table.add_row("", "")
+            econ_table.add_row("[bold]Sample Economic Flags[/bold]", "")
+            for reason in sample_reasons[:5]:
+                # Truncate long reasons
+                display_reason = reason[:60] + "..." if len(reason) > 60 else reason
+                econ_table.add_row("", display_reason)
+
+        console.print(econ_table)
+
     reconciler.close()
 
     console.print(f"\n[bold green]Stress test complete![/bold green]")
