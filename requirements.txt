@@ -1,0 +1,32 @@
+# Sage Intacct & API
+requests>=2.31.0
+xmltodict>=0.13.0
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+python-dateutil>=2.8.2
+
+# Fuzzy Matching
+rapidfuzz>=3.5.0
+jellyfish>=1.0.0
+
+# Economic Data
+yfinance>=0.2.33
+fredapi>=0.5.1
+
+# Database
+sqlalchemy>=2.0.0
+sqlite3  # built-in
+
+# Reporting
+openpyxl>=3.1.0
+jinja2>=3.1.0
+
+# CLI
+click>=8.1.0
+rich>=13.0.0
+
+# Configuration
+python-dotenv>=1.0.0
+pyyaml>=6.0.0
