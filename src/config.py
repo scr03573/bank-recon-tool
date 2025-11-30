@@ -46,10 +46,32 @@ class MatchingConfig:
 
 
 @dataclass
+class MarketDataConfig:
+    """Market data provider configuration."""
+    intrinio_api_key: str = field(default_factory=lambda: os.getenv("INTRINIO_API_KEY", ""))
+    fred_api_key: str = field(default_factory=lambda: os.getenv("FRED_API_KEY", ""))
+    # Priority: intrinio_first, yfinance_first, intrinio_only, yfinance_only, best_available
+    data_priority: str = field(default_factory=lambda: os.getenv("MARKET_DATA_PRIORITY", "yfinance_first"))
+    cache_duration_minutes: int = field(
+        default_factory=lambda: int(os.getenv("MARKET_DATA_CACHE_MINUTES", "15"))
+    )
+    enable_economic_validation: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_ECONOMIC_VALIDATION", "true").lower() == "true"
+    )
+
+    def is_intrinio_configured(self) -> bool:
+        return bool(self.intrinio_api_key)
+
+    def is_fred_configured(self) -> bool:
+        return bool(self.fred_api_key)
+
+
+@dataclass
 class Config:
     """Main application configuration."""
     intacct: IntacctConfig = field(default_factory=IntacctConfig)
     matching: MatchingConfig = field(default_factory=MatchingConfig)
+    market_data: MarketDataConfig = field(default_factory=MarketDataConfig)
     fred_api_key: str = field(default_factory=lambda: os.getenv("FRED_API_KEY", ""))
     database_url: str = field(
         default_factory=lambda: os.getenv("DATABASE_URL", "sqlite:///./reconciliation.db")

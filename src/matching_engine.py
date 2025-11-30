@@ -7,7 +7,7 @@ Matches bank transactions to AP records using multiple strategies:
 3. Amount tolerance matching
 4. Reference/ACH code matching
 5. Batch payment detection
-6. Economic data validation (FRED + yfinance)
+6. Economic data validation (Intrinio + yfinance + FRED)
 """
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -15,6 +15,7 @@ from decimal import Decimal
 from typing import List, Dict, Tuple, Optional, Set, Any
 from collections import defaultdict
 import warnings
+import logging
 
 from rapidfuzz import fuzz, process
 import jellyfish
@@ -25,12 +26,14 @@ from .models import (
     BankTransaction, APTransaction, ReconciliationMatch,
     ReconciliationException, MatchStatus, ExceptionType, TransactionType
 )
+from .market_data import (
+    UnifiedMarketDataProvider, DataPriority, StockQuote,
+    CompanyInfo, EconomicIndicator, MarketSnapshot
+)
 
 # Suppress yfinance warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*yfinance.*")
-
-import logging
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
 
@@ -58,180 +61,108 @@ class EconomicValidationResult:
 
 class EconomicValidator:
     """
-    Validates transactions using economic data from FRED and yfinance.
+    Validates transactions using economic data from Intrinio, yfinance, and FRED.
 
-    Uses real market data to:
+    Uses the UnifiedMarketDataProvider for:
     1. Validate vendor stock tickers (publicly traded companies)
     2. Adjust confidence based on market conditions
     3. Flag anomalies based on economic indicators
     4. Cross-reference payment patterns with market data
 
+    Data Sources:
+    - Intrinio: Premium financial data (if API key provided)
+    - yfinance: Free market data (default fallback)
+    - FRED: Economic indicators (interest rates, inflation)
+
     Performance optimizations:
-    - Caches all stock data after first fetch (session-based)
-    - Pre-fetches economic indicators once per session
-    - Uses batch ticker lookups where possible
+    - Uses unified provider with intelligent caching
+    - Batch ticker lookups for efficiency
+    - Automatic fallback between data sources
     """
 
-    # Map common vendor names to stock tickers
-    VENDOR_TICKERS = {
-        "AMAZON": "AMZN",
-        "AMAZON WEB SERVICES": "AMZN",
-        "AWS": "AMZN",
-        "MICROSOFT": "MSFT",
-        "GOOGLE": "GOOGL",
-        "APPLE": "AAPL",
-        "ADOBE": "ADBE",
-        "SALESFORCE": "CRM",
-        "ORACLE": "ORCL",
-        "IBM": "IBM",
-        "DELL": "DELL",
-        "HP": "HPQ",
-        "CISCO": "CSCO",
-        "INTEL": "INTC",
-        "AT&T": "T",
-        "ATT": "T",
-        "VERIZON": "VZ",
-        "COMCAST": "CMCSA",
-        "FEDEX": "FDX",
-        "UPS": "UPS",
-        "UNITED AIRLINES": "UAL",
-        "AMERICAN AIRLINES": "AAL",
-        "DELTA": "DAL",
-        "MARRIOTT": "MAR",
-        "HILTON": "HLT",
-        "HOME DEPOT": "HD",
-        "LOWES": "LOW",
-        "STAPLES": "SPLS",
-        "OFFICE DEPOT": "ODP",
-        "GRAINGER": "GWW",
-        "FASTENAL": "FAST",
-        "SYSCO": "SYY",
-        "BANK OF AMERICA": "BAC",
-        "WELLS FARGO": "WFC",
-        "CHASE": "JPM",
-        "JPMORGAN": "JPM",
-        "CAPITAL ONE": "COF",
-        "AMERICAN EXPRESS": "AXP",
-        "VISA": "V",
-        "MASTERCARD": "MA",
-        "BLUE CROSS": "ANTM",
-        "AETNA": "CVS",
-        "UNITED HEALTH": "UNH",
-        "STATE FARM": None,  # Private
-        "PROGRESSIVE": "PGR",
-        "ADP": "ADP",
-        "PAYCHEX": "PAYX",
-    }
+    def __init__(
+        self,
+        intrinio_api_key: Optional[str] = None,
+        fred_api_key: Optional[str] = None,
+        data_priority: str = "yfinance_first"
+    ):
+        # Get config values with fallbacks
+        self.intrinio_api_key = intrinio_api_key or config.market_data.intrinio_api_key
+        self.fred_api_key = fred_api_key or config.market_data.fred_api_key or config.fred_api_key
 
-    def __init__(self, fred_api_key: Optional[str] = None):
-        self.fred_api_key = fred_api_key or config.fred_api_key
-        self._fred = None
-        self._stock_cache: Dict[str, Dict[str, Any]] = {}  # ticker -> price/volume data
+        # Map string priority to enum
+        priority_map = {
+            "intrinio_first": DataPriority.INTRINIO_FIRST,
+            "yfinance_first": DataPriority.YFINANCE_FIRST,
+            "intrinio_only": DataPriority.INTRINIO_ONLY,
+            "yfinance_only": DataPriority.YFINANCE_ONLY,
+            "best_available": DataPriority.BEST_AVAILABLE
+        }
+        self.data_priority = priority_map.get(
+            data_priority or config.market_data.data_priority,
+            DataPriority.YFINANCE_FIRST
+        )
+
+        # Initialize unified market data provider
+        self._market_provider: Optional[UnifiedMarketDataProvider] = None
+        self._market_snapshot: Optional[MarketSnapshot] = None
+        self._data_initialized: bool = False
+
+        # Cache for economic indicators
         self._econ_cache: Dict[str, float] = {}
-        self._econ_fetched: bool = False
-        self._stocks_prefetched: bool = False
+        self._stock_cache: Dict[str, Dict[str, Any]] = {}
 
-    def _get_fred(self):
-        """Lazy load FRED client."""
-        if self._fred is None and self.fred_api_key:
-            try:
-                from fredapi import Fred
-                self._fred = Fred(api_key=self.fred_api_key)
-            except Exception:
-                pass
-        return self._fred
+    @property
+    def market_provider(self) -> UnifiedMarketDataProvider:
+        """Lazy load market data provider."""
+        if self._market_provider is None:
+            self._market_provider = UnifiedMarketDataProvider(
+                intrinio_api_key=self.intrinio_api_key,
+                fred_api_key=self.fred_api_key,
+                priority=self.data_priority
+            )
+        return self._market_provider
+
+    def _initialize_data(self):
+        """Initialize market data (called once per session)."""
+        if self._data_initialized:
+            return
+
+        try:
+            # Get market snapshot (includes indices, VIX, economic indicators)
+            self._market_snapshot = self.market_provider.get_market_snapshot()
+
+            # Extract economic indicators into cache
+            for key, indicator in self._market_snapshot.economic_indicators.items():
+                self._econ_cache[key] = indicator.value
+
+            # Pre-fetch all vendor tickers
+            tickers = [t for t in self.market_provider.VENDOR_TICKERS.values() if t]
+            tickers.append('^GSPC')  # S&P 500
+            quotes = self.market_provider.batch_get_quotes(tickers)
+
+            # Convert quotes to cache format
+            for ticker, quote in quotes.items():
+                self._stock_cache[ticker] = {
+                    'price': quote.price,
+                    'active': True,
+                    'change_percent': quote.change_percent,
+                    'volume': quote.volume,
+                    'source': quote.source.value
+                }
+
+        except Exception as e:
+            logging.debug(f"Failed to initialize market data: {e}")
+
+        self._data_initialized = True
 
     def prefetch_all_stock_data(self):
-        """Pre-fetch all known stock tickers in one batch for performance."""
-        if self._stocks_prefetched:
-            return
-
-        # Get vendor tickers plus market indices
-        tickers_to_fetch = [t for t in set(self.VENDOR_TICKERS.values()) if t is not None]
-        tickers_to_fetch.append('^GSPC')  # S&P 500 for large payment validation
-
-        try:
-            import yfinance as yf
-            # Batch download all tickers at once
-            tickers_str = " ".join(tickers_to_fetch)
-            data = yf.download(tickers_str, period='5d', progress=False, threads=True)
-
-            if data is not None and not data.empty:
-                for ticker in tickers_to_fetch:
-                    try:
-                        # Handle both single and multi-ticker dataframe formats
-                        if isinstance(data.columns, pd.MultiIndex):
-                            # Multi-ticker format: columns are (Price, Ticker)
-                            if ('Close', ticker) in data.columns:
-                                close_prices = data[('Close', ticker)]
-                            elif ticker in data['Close'].columns:
-                                close_prices = data['Close'][ticker]
-                            else:
-                                close_prices = None
-                        else:
-                            # Single ticker format
-                            close_prices = data['Close'] if 'Close' in data.columns else None
-
-                        if close_prices is not None and len(close_prices.dropna()) > 0:
-                            last_price = float(close_prices.dropna().iloc[-1])
-                            self._stock_cache[ticker] = {
-                                'price': round(last_price, 2),
-                                'active': True
-                            }
-                            if len(close_prices.dropna()) >= 2:
-                                first_price = float(close_prices.dropna().iloc[0])
-                                if first_price > 0:
-                                    change = (last_price - first_price) / first_price
-                                    self._stock_cache[ticker]['price_change_5d'] = round(change * 100, 2)
-                        else:
-                            self._stock_cache[ticker] = {'active': False}
-                    except Exception:
-                        self._stock_cache[ticker] = {'active': False}
-        except Exception:
-            pass
-
-        self._stocks_prefetched = True
+        """Pre-fetch all stock data using unified provider."""
+        self._initialize_data()
 
     def _refresh_economic_data(self):
-        """Refresh economic indicators from FRED (once per session)."""
-        if self._econ_fetched:
-            return
-
-        self._econ_cache = {}
-        fred = self._get_fred()
-        target_date = date.today()
-
-        if fred:
-            try:
-                # Fed Funds Rate
-                ff = fred.get_series('FEDFUNDS', observation_start=target_date - timedelta(days=30))
-                if ff is not None and len(ff) > 0:
-                    self._econ_cache['fed_funds_rate'] = float(ff.iloc[-1])
-
-                # 10Y Treasury
-                t10 = fred.get_series('DGS10', observation_start=target_date - timedelta(days=30))
-                if t10 is not None and len(t10) > 0:
-                    self._econ_cache['treasury_10y'] = float(t10.iloc[-1])
-
-                # 2Y Treasury
-                t2 = fred.get_series('DGS2', observation_start=target_date - timedelta(days=30))
-                if t2 is not None and len(t2) > 0:
-                    self._econ_cache['treasury_2y'] = float(t2.iloc[-1])
-
-            except Exception:
-                pass
-
-        # Get VIX from yfinance (single fetch)
-        try:
-            import yfinance as yf
-            vix = yf.Ticker('^VIX')
-            hist = vix.history(period='5d')
-            if hist is not None and len(hist) > 0:
-                self._econ_cache['vix'] = float(hist['Close'].iloc[-1])
-        except Exception:
-            pass
-
-        self._econ_fetched = True
+        """Refresh economic indicators using unified provider."""
+        self._initialize_data()
 
     def validate_transaction(
         self,
@@ -293,21 +224,12 @@ class EconomicValidator:
         return result
 
     def _validate_vendor_ticker(self, vendor_name: str) -> Optional[Dict[str, Any]]:
-        """Validate vendor by checking stock ticker (uses cached data)."""
+        """Validate vendor by checking stock ticker (uses unified market provider)."""
         if not vendor_name:
             return None
 
-        # Normalize and lookup ticker
-        normalized = vendor_name.upper()
-        for suffix in [' INC', ' LLC', ' LTD', ' CORP', ' CORPORATION', ' CO']:
-            normalized = normalized.replace(suffix, '')
-        normalized = normalized.strip()
-
-        ticker_symbol = None
-        for vendor_key, symbol in self.VENDOR_TICKERS.items():
-            if vendor_key in normalized or normalized in vendor_key:
-                ticker_symbol = symbol
-                break
+        # Use unified provider for ticker lookup
+        ticker_symbol = self.market_provider.lookup_ticker(vendor_name)
 
         if not ticker_symbol:
             return {'ticker_found': False, 'vendor': vendor_name}
@@ -320,16 +242,18 @@ class EconomicValidator:
             'company_active': False
         }
 
-        # Use cached data instead of making API call
+        # Use cached data from unified provider
         if ticker_symbol in self._stock_cache:
             cached = self._stock_cache[ticker_symbol]
             result['company_active'] = cached.get('active', False)
             if 'price' in cached:
                 result['price'] = cached['price']
-            if 'price_change_5d' in cached:
-                result['price_change_5d'] = cached['price_change_5d']
-                if abs(cached['price_change_5d']) > 10:  # >10% move
+            if 'change_percent' in cached:
+                result['price_change_5d'] = cached['change_percent']
+                if abs(cached['change_percent']) > 10:  # >10% move
                     result['unusual_activity'] = True
+            if 'source' in cached:
+                result['data_source'] = cached['source']
 
         return result
 
@@ -433,9 +357,9 @@ class EconomicValidator:
         # Check S&P 500 for market context (use cached data if available)
         if '^GSPC' in self._stock_cache:
             cached = self._stock_cache['^GSPC']
-            if 'price_change_5d' in cached:
-                sp_change = cached['price_change_5d'] / 100  # Convert from percentage
-                result['sp500_5d_change'] = cached['price_change_5d']
+            if 'change_percent' in cached:
+                sp_change = cached['change_percent'] / 100  # Convert from percentage
+                result['sp500_5d_change'] = cached['change_percent']
                 if sp_change < -0.03:  # Market down >3%
                     result['flags'].append(f"Large payment during market decline (S&P 500: {sp_change*100:.1f}%)")
                     result['adjustment'] -= 0.01
@@ -452,11 +376,16 @@ class EconomicValidator:
 
         summary = {
             'as_of': date.today().isoformat(),
-            'indicators': {}
+            'indicators': {},
+            'data_sources': []
         }
+
+        # Track which data sources provided data
+        data_sources = set()
 
         if 'fed_funds_rate' in self._econ_cache:
             summary['indicators']['fed_funds_rate'] = f"{self._econ_cache['fed_funds_rate']:.2f}%"
+            data_sources.add('FRED')
 
         if 'treasury_10y' in self._econ_cache:
             summary['indicators']['treasury_10y'] = f"{self._econ_cache['treasury_10y']:.2f}%"
@@ -475,6 +404,25 @@ class EconomicValidator:
             spread = self._econ_cache['treasury_10y'] - self._econ_cache['treasury_2y']
             summary['indicators']['yield_curve_spread'] = f"{spread:.2f}%"
             summary['yield_curve_inverted'] = spread < 0
+
+        # Add S&P 500 info if available
+        if '^GSPC' in self._stock_cache:
+            sp = self._stock_cache['^GSPC']
+            if 'price' in sp:
+                summary['indicators']['sp500'] = f"${sp['price']:,.2f}"
+            if 'change_percent' in sp:
+                summary['indicators']['sp500_change'] = f"{sp['change_percent']:.2f}%"
+            if 'source' in sp:
+                data_sources.add(sp['source'].upper() if isinstance(sp['source'], str) else sp['source'])
+
+        # Check stock cache for data sources
+        for ticker, data in self._stock_cache.items():
+            if 'source' in data:
+                source = data['source'].upper() if isinstance(data['source'], str) else data['source']
+                data_sources.add(source)
+
+        summary['data_sources'] = list(data_sources)
+        summary['data_priority'] = self.data_priority.value if hasattr(self.data_priority, 'value') else str(self.data_priority)
 
         return summary
 

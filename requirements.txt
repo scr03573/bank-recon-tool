@@ -11,9 +11,10 @@ python-dateutil>=2.8.2
 rapidfuzz>=3.5.0
 jellyfish>=1.0.0
 
-# Economic Data
+# Market Data Providers
 yfinance>=0.2.33
 fredapi>=0.5.1
+intrinio-sdk>=6.27.0  # Optional: premium financial data
 
 # Database
 sqlalchemy>=2.0.0
