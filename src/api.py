@@ -6,22 +6,41 @@ Provides REST API endpoints for:
 - Viewing market data
 - Managing exceptions
 - Accessing reconciliation history
+
+Features:
+- JWT Authentication (optional, enabled via AUTH_ENABLED=true)
+- Rate limiting
+- Structured logging
+- Input validation
 """
-from fastapi import FastAPI, HTTPException, UploadFile, File, Query
+from fastapi import FastAPI, HTTPException, UploadFile, File, Query, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field, validator
 from typing import List, Optional, Dict, Any
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from collections import defaultdict
 import tempfile
 import json
 import os
+import time
 
 from .reconciler import BankReconciler, create_sample_data
 from .market_data import UnifiedMarketDataProvider, DataPriority
 from .config import config
 from .models import ExceptionType
+from .logging_config import setup_logging, get_logger, log_api_request, log_error
+from .auth import (
+    Token, LoginRequest, User, authenticate_user, create_access_token,
+    get_current_user, require_auth, require_permission, ACCESS_TOKEN_EXPIRE_MINUTES
+)
+
+# Setup logging
+logger = setup_logging(level="INFO")
+
+# Check if auth is enabled
+AUTH_ENABLED = os.environ.get("AUTH_ENABLED", "false").lower() == "true"
 
 app = FastAPI(
     title="Bank Reconciliation API",
@@ -30,13 +49,77 @@ app = FastAPI(
 )
 
 # CORS for frontend
+ALLOWED_ORIGINS = os.environ.get(
+    "CORS_ORIGINS",
+    "http://localhost:3000,http://localhost:5173,http://127.0.0.1:5173"
+).split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ============== Rate Limiting ==============
+
+class RateLimiter:
+    """Simple in-memory rate limiter."""
+
+    def __init__(self, requests_per_minute: int = 60):
+        self.requests_per_minute = requests_per_minute
+        self.requests: Dict[str, List[float]] = defaultdict(list)
+
+    def is_allowed(self, client_id: str) -> bool:
+        """Check if request is allowed."""
+        now = time.time()
+        minute_ago = now - 60
+
+        # Clean old requests
+        self.requests[client_id] = [
+            t for t in self.requests[client_id] if t > minute_ago
+        ]
+
+        # Check limit
+        if len(self.requests[client_id]) >= self.requests_per_minute:
+            return False
+
+        self.requests[client_id].append(now)
+        return True
+
+
+rate_limiter = RateLimiter(requests_per_minute=100)
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    """Rate limiting middleware."""
+    client_ip = request.client.host if request.client else "unknown"
+
+    if not rate_limiter.is_allowed(client_ip):
+        logger.warning(f"Rate limit exceeded for {client_ip}")
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Too many requests. Please try again later."}
+        )
+
+    # Log request timing
+    start_time = time.time()
+    response = await call_next(request)
+    duration_ms = (time.time() - start_time) * 1000
+
+    log_api_request(
+        logger,
+        request.method,
+        str(request.url.path),
+        response.status_code,
+        duration_ms,
+        client_ip
+    )
+
+    return response
 
 # Global instances (lazy loaded)
 _reconciler: Optional[BankReconciler] = None
@@ -163,7 +246,49 @@ async def root():
         "name": "Bank Reconciliation API",
         "version": "1.0.0",
         "status": "running",
-        "docs": "/docs"
+        "docs": "/docs",
+        "auth_enabled": AUTH_ENABLED
+    }
+
+
+# ------------ Authentication Endpoints ------------
+
+@app.post("/api/auth/login", response_model=Token)
+async def login(request: LoginRequest):
+    """Authenticate user and return JWT token."""
+    user = authenticate_user(request.username, request.password)
+    if not user:
+        logger.warning(f"Failed login attempt for user: {request.username}")
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid username or password"
+        )
+
+    access_token = create_access_token(
+        data={"sub": user["username"], "role": user["role"]},
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+
+    logger.info(f"User logged in: {user['username']}")
+
+    return Token(
+        access_token=access_token,
+        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        user={
+            "username": user["username"],
+            "role": user["role"],
+            "full_name": user["full_name"]
+        }
+    )
+
+
+@app.get("/api/auth/me")
+async def get_current_user_info(user: User = Depends(require_auth)):
+    """Get current authenticated user info."""
+    return {
+        "username": user.username,
+        "role": user.role,
+        "full_name": user.full_name
     }
 
 
@@ -273,14 +398,54 @@ async def run_reconciliation_with_file(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/reconcile/history", response_model=List[ReconciliationSummary])
-async def get_reconciliation_history(limit: int = Query(10, ge=1, le=100)):
-    """Get recent reconciliation runs."""
+class PaginatedResponse(BaseModel):
+    """Paginated response wrapper."""
+    items: List[Any]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
+@app.get("/api/reconcile/history")
+async def get_reconciliation_history(
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(10, ge=1, le=100, description="Items per page"),
+    start_date: Optional[str] = Query(None, description="Filter by start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="Filter by end date (YYYY-MM-DD)")
+):
+    """
+    Get reconciliation history with pagination.
+
+    Returns paginated list of reconciliation runs.
+    """
     try:
         reconciler = get_reconciler()
-        history = reconciler.get_reconciliation_history(limit=limit)
 
-        return [
+        # Get total count (we'd need to add this to reconciler, for now estimate)
+        all_history = reconciler.get_reconciliation_history(limit=1000)
+
+        # Filter by date if specified
+        if start_date or end_date:
+            filtered = []
+            for h in all_history:
+                run_date = h.get('run_date', '')
+                if start_date and run_date < start_date:
+                    continue
+                if end_date and run_date > end_date:
+                    continue
+                filtered.append(h)
+            all_history = filtered
+
+        total = len(all_history)
+        total_pages = (total + page_size - 1) // page_size
+
+        # Apply pagination
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        paginated = all_history[start_idx:end_idx]
+
+        items = [
             ReconciliationSummary(
                 run_id=h.get('id', ''),
                 status=h.get('status', 'completed'),
@@ -294,9 +459,18 @@ async def get_reconciliation_history(limit: int = Query(10, ge=1, le=100)):
                 end_date=h.get('period_end', ''),
                 created_at=h.get('run_date', datetime.now().isoformat())
             )
-            for h in history
+            for h in paginated
         ]
+
+        return {
+            "items": [item.dict() for item in items],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages
+        }
     except Exception as e:
+        log_error(logger, e, "get_reconciliation_history")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -649,16 +823,31 @@ async def resolve_exception(exception_id: str, request: ResolveExceptionRequest)
 async def get_report(run_id: str, format: str):
     """Download a report file."""
     try:
-        reconciler = get_reconciler()
-        result = reconciler.get_run(run_id)
+        # First check in-memory results
+        if run_id in _recent_results:
+            result = _recent_results[run_id]
+            if hasattr(result, 'report_paths') and format in result.report_paths:
+                path = result.report_paths[format]
+                if Path(path).exists():
+                    return FileResponse(
+                        path,
+                        filename=Path(path).name,
+                        media_type="application/octet-stream"
+                    )
 
-        if not result:
+        # Fall back to database lookup
+        reconciler = get_reconciler()
+        run_details = reconciler.get_run_details(run_id)
+
+        if not run_details:
             raise HTTPException(status_code=404, detail="Run not found")
 
-        if format not in result.report_paths:
+        # Check for report paths in the details
+        report_paths = run_details.get('report_paths', {})
+        if format not in report_paths:
             raise HTTPException(status_code=404, detail=f"Report format '{format}' not found")
 
-        path = result.report_paths[format]
+        path = report_paths[format]
         if not Path(path).exists():
             raise HTTPException(status_code=404, detail="Report file not found")
 
