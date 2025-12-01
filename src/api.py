@@ -183,6 +183,10 @@ async def get_status():
 
 # ------------ Reconciliation Endpoints ------------
 
+# Store recent reconciliation results in memory for quick access
+_recent_results: Dict[str, Any] = {}
+
+
 @app.post("/api/reconcile/demo", response_model=ReconciliationSummary)
 async def run_demo_reconciliation():
     """Run a demo reconciliation with sample data."""
@@ -203,8 +207,12 @@ async def run_demo_reconciliation():
             report_formats=["excel", "html", "json"]
         )
 
+        # Store result for later retrieval
+        run_id = result.summary.id
+        _recent_results[run_id] = result
+
         return ReconciliationSummary(
-            run_id=result.summary.id,
+            run_id=run_id,
             status="completed",
             total_bank_transactions=result.summary.total_bank_transactions,
             total_ap_transactions=result.summary.total_ap_transactions,
@@ -451,6 +459,111 @@ async def validate_vendor(vendor_name: str):
 
 # ------------ Exception Endpoints ------------
 
+@app.get("/api/reconcile/{run_id}/matches")
+async def get_matches_for_run(run_id: str):
+    """Get matches for a specific reconciliation run."""
+    try:
+        if run_id not in _recent_results:
+            raise HTTPException(status_code=404, detail="Run not found or expired. Run a new reconciliation.")
+
+        result = _recent_results[run_id]
+        matches = []
+
+        for m in result.matches:
+            match_data = {
+                "match_id": m.id,  # Using 'id' from ReconciliationMatch model
+                "confidence_score": m.confidence_score,
+                "match_status": m.match_status.value if hasattr(m.match_status, 'value') else str(m.match_status),
+                "match_reasons": m.match_reasons,
+                "bank_transaction": None,
+                "ap_transactions": []
+            }
+
+            if m.bank_transaction:
+                bt = m.bank_transaction
+                match_data["bank_transaction"] = {
+                    "id": bt.id,
+                    "date": bt.transaction_date.isoformat() if bt.transaction_date else "",
+                    "amount": float(bt.amount),
+                    "description": bt.description or "",
+                    "reference": bt.reference_number or "",
+                    "check_number": bt.check_number or "",
+                    "vendor_name": bt.vendor_name or ""
+                }
+
+            for ap in m.ap_transactions:
+                match_data["ap_transactions"].append({
+                    "id": ap.id,
+                    "date": ap.payment_date.isoformat() if ap.payment_date else "",
+                    "amount": float(ap.amount),
+                    "paid_amount": float(ap.paid_amount),
+                    "vendor_name": ap.vendor_name or "",
+                    "bill_number": ap.bill_number or "",
+                    "check_number": ap.check_number or ""
+                })
+
+            matches.append(match_data)
+
+        return {"run_id": run_id, "matches": matches, "count": len(matches)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/reconcile/{run_id}/exceptions")
+async def get_exceptions_for_run(run_id: str):
+    """Get exceptions for a specific reconciliation run."""
+    try:
+        if run_id not in _recent_results:
+            raise HTTPException(status_code=404, detail="Run not found or expired. Run a new reconciliation.")
+
+        result = _recent_results[run_id]
+        exceptions = []
+
+        for e in result.exceptions:
+            exc_data = {
+                "exception_id": e.id,  # Using 'id' from ReconciliationException model
+                "exception_type": e.exception_type.value if hasattr(e.exception_type, 'value') else str(e.exception_type),
+                "severity": e.severity,
+                "description": e.description,
+                "suggested_action": e.suggested_action or "",
+                "is_resolved": e.resolved,  # Using 'resolved' not 'is_resolved'
+                "resolution_notes": e.resolution_notes,
+                "created_at": e.created_at.isoformat() if e.created_at else ""
+            }
+
+            # Check for bank_transaction
+            if e.bank_transaction:
+                bt = e.bank_transaction
+                exc_data["bank_transaction"] = {
+                    "id": bt.id,
+                    "date": bt.transaction_date.isoformat() if bt.transaction_date else "",
+                    "amount": float(bt.amount),
+                    "description": bt.description or "",
+                    "vendor_name": bt.vendor_name or ""
+                }
+
+            # Check for ap_transaction
+            if e.ap_transaction:
+                ap = e.ap_transaction
+                exc_data["ap_transaction"] = {
+                    "id": ap.id,
+                    "date": ap.payment_date.isoformat() if ap.payment_date else "",
+                    "amount": float(ap.amount),
+                    "vendor_name": ap.vendor_name or "",
+                    "bill_number": ap.bill_number or ""
+                }
+
+            exceptions.append(exc_data)
+
+        return {"run_id": run_id, "exceptions": exceptions, "count": len(exceptions)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/exceptions", response_model=List[ExceptionDetail])
 async def get_exceptions(
     run_id: Optional[str] = None,
@@ -459,41 +572,54 @@ async def get_exceptions(
 ):
     """Get exceptions, optionally filtered."""
     try:
-        reconciler = get_reconciler()
-
-        if run_id:
-            result = reconciler.get_run(run_id)
-            if not result:
-                raise HTTPException(status_code=404, detail="Run not found")
+        # Try to get from recent results first
+        if run_id and run_id in _recent_results:
+            result = _recent_results[run_id]
             exceptions = result.exceptions
+        elif _recent_results:
+            # Get from most recent result
+            run_id = list(_recent_results.keys())[-1]
+            exceptions = _recent_results[run_id].exceptions
         else:
-            # Get from most recent run
-            history = reconciler.get_history(limit=1)
-            if not history:
-                return []
-            exceptions = history[0].exceptions if history[0].exceptions else []
+            return []
 
         # Filter
         if exception_type:
-            exceptions = [e for e in exceptions if e.exception_type.value == exception_type]
+            exceptions = [e for e in exceptions if (e.exception_type.value if hasattr(e.exception_type, 'value') else str(e.exception_type)) == exception_type]
         if unresolved_only:
-            exceptions = [e for e in exceptions if not e.is_resolved]
+            exceptions = [e for e in exceptions if not e.resolved]
 
-        return [
-            ExceptionDetail(
-                exception_id=e.exception_id,
+        result_list = []
+        for e in exceptions:
+            # Get transaction info - could be bank or ap transaction
+            txn = e.bank_transaction or e.ap_transaction
+            txn_id = ""
+            txn_date = ""
+            txn_amount = 0.0
+
+            if e.bank_transaction:
+                txn_id = e.bank_transaction.id
+                txn_date = e.bank_transaction.transaction_date.isoformat() if e.bank_transaction.transaction_date else ""
+                txn_amount = float(e.bank_transaction.amount)
+            elif e.ap_transaction:
+                txn_id = e.ap_transaction.id
+                txn_date = e.ap_transaction.payment_date.isoformat() if e.ap_transaction.payment_date else ""
+                txn_amount = float(e.ap_transaction.amount)
+
+            result_list.append(ExceptionDetail(
+                exception_id=e.id,
                 exception_type=e.exception_type.value if hasattr(e.exception_type, 'value') else str(e.exception_type),
-                severity=e.severity.value if hasattr(e.severity, 'value') else str(e.severity),
-                transaction_id=e.transaction.transaction_id if e.transaction else "",
-                transaction_date=e.transaction.date.isoformat() if e.transaction else "",
-                amount=float(e.transaction.amount) if e.transaction else 0.0,
+                severity=e.severity if isinstance(e.severity, str) else (e.severity.value if hasattr(e.severity, 'value') else str(e.severity)),
+                transaction_id=txn_id,
+                transaction_date=txn_date,
+                amount=txn_amount,
                 description=e.description,
                 suggested_action=e.suggested_action or "",
-                is_resolved=e.is_resolved,
+                is_resolved=e.resolved,
                 resolution_notes=e.resolution_notes
-            )
-            for e in exceptions
-        ]
+            ))
+
+        return result_list
     except HTTPException:
         raise
     except Exception as e:
