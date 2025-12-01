@@ -155,10 +155,11 @@ export default function Exceptions() {
 
   const fetchHistory = async () => {
     try {
-      const res = await getReconciliationHistory(10);
-      setHistory(res.data);
-      if (res.data.length > 0) {
-        setSelectedRun(res.data[0].run_id);
+      const res = await getReconciliationHistory(1, 10);
+      const items = res.data?.items || [];
+      setHistory(items);
+      if (items.length > 0) {
+        setSelectedRun(items[0].run_id);
       }
     } catch (err) {
       console.error('Failed to load history:', err);

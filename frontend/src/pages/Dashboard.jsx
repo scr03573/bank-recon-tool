@@ -75,11 +75,11 @@ export default function Dashboard() {
       const [statusRes, marketRes, historyRes] = await Promise.all([
         getStatus(),
         getMarketSnapshot().catch(() => ({ data: null })),
-        getReconciliationHistory(5)
+        getReconciliationHistory(1, 5)
       ]);
       setStatus(statusRes.data);
       setMarket(marketRes.data);
-      setHistory(historyRes.data);
+      setHistory(historyRes.data?.items || []);
     } catch (err) {
       setError(err.response?.data?.detail || 'Failed to load data');
     } finally {

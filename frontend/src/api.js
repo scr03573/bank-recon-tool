@@ -25,8 +25,8 @@ export const uploadAndReconcile = (file, startDate, endDate, bankAccountId = 'CH
   );
 };
 
-export const getReconciliationHistory = (limit = 10) =>
-  api.get(`/reconcile/history?limit=${limit}`);
+export const getReconciliationHistory = (page = 1, pageSize = 10) =>
+  api.get(`/reconcile/history?page=${page}&page_size=${pageSize}`);
 
 export const getReconciliationDetail = (runId) =>
   api.get(`/reconcile/${runId}`);

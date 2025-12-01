@@ -96,10 +96,11 @@ export default function Reconciliations() {
   const fetchHistory = async () => {
     setLoading(true);
     try {
-      const res = await getReconciliationHistory(20);
-      setHistory(res.data);
-      if (res.data.length > 0 && !selectedRun) {
-        setSelectedRun(res.data[0].run_id);
+      const res = await getReconciliationHistory(1, 20);
+      const items = res.data?.items || [];
+      setHistory(items);
+      if (items.length > 0 && !selectedRun) {
+        setSelectedRun(items[0].run_id);
       }
     } catch (err) {
       setError(err.response?.data?.detail || 'Failed to load history');
